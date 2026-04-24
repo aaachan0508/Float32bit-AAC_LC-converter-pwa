@@ -1,5 +1,7 @@
 import { defineConfig } from 'vite'
+import preact from '@preact/preset-vite'
 
 export default defineConfig({
-  base: '/Float32bit-AAC_LC-converter-pwa/'
+  plugins: [preact()],
+  base: '/Float32bit-AAC_LC-converter-pwa/',
 })

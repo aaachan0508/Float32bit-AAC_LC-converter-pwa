@@ -13,6 +13,15 @@ type ResultItem = {
   elapsedMs: number
 }
 
+type MergeResultItem = {
+  name: string
+  url: string
+  inputCount: number
+  totalInputSize: number
+  outputSize: number
+  elapsedMs: number
+}
+
 type ProgressState = {
   fileName: string
   phase: string
@@ -28,6 +37,8 @@ type CacheInfo = {
 
 const TARGET_PEAK_DB = -3.0
 const FFMPEG_CORE_BASE_URL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm'
+
+type FfmpegFileData = string | Uint8Array
 
 function getExt(name: string): string {
   const m = name.match(/\.([^.]+)$/)
@@ -99,6 +110,29 @@ function formatRequestUrl(urlText: string): string {
   }
 }
 
+function fileDataToArrayBuffer(data: FfmpegFileData): ArrayBuffer {
+  const bytes =
+    typeof data === 'string'
+      ? new TextEncoder().encode(data)
+      : new Uint8Array(data)
+
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer
+}
+
+function makeTimestampFileName(prefix: string): string {
+  const d = new Date()
+  const yyyy = String(d.getFullYear())
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mi = String(d.getMinutes()).padStart(2, '0')
+  const ss = String(d.getSeconds()).padStart(2, '0')
+  return `${prefix}_${yyyy}${mm}${dd}_${hh}${mi}${ss}.m4a`
+}
+
 export function App() {
   const ffmpegRef = useRef(new FFmpeg())
   const loadedRef = useRef(false)
@@ -109,6 +143,9 @@ export function App() {
   const [status, setStatus] = useState('待機中')
   const [busy, setBusy] = useState(false)
   const [results, setResults] = useState<ResultItem[]>([])
+  const [mergeFiles, setMergeFiles] = useState<File[]>([])
+  const [mergeResult, setMergeResult] = useState<MergeResultItem | null>(null)
+  const [mergeStatus, setMergeStatus] = useState('未選択')
   const [useLimiter, setUseLimiter] = useState(false)
   const [renameByDate, setRenameByDate] = useState(true)
   const [progress, setProgress] = useState<ProgressState | null>(null)
@@ -312,17 +349,7 @@ export function App() {
     await ffmpeg.exec(args)
 
     const data = await ffmpeg.readFile(outputName)
-
-    const bytes =
-      typeof data === 'string'
-        ? new TextEncoder().encode(data)
-        : new Uint8Array(data)
-
-    const arrayBuffer = bytes.buffer.slice(
-      bytes.byteOffset,
-      bytes.byteOffset + bytes.byteLength,
-    ) as ArrayBuffer
-
+    const arrayBuffer = fileDataToArrayBuffer(data)
     const blob = new Blob([arrayBuffer], { type: 'audio/mp4' })
     const url = URL.createObjectURL(blob)
 
@@ -378,6 +405,120 @@ export function App() {
     }
   }
 
+  function handleMergeFiles(files: FileList | null) {
+    const sortedFiles = Array.from(files ?? [])
+      .filter((file) => file.name.toLowerCase().endsWith('.m4a'))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }))
+
+    if (mergeResult) {
+      URL.revokeObjectURL(mergeResult.url)
+    }
+
+    setMergeFiles(sortedFiles)
+    setMergeResult(null)
+    setMergeStatus(sortedFiles.length === 0 ? 'm4a が選択されていません' : `${sortedFiles.length} 件選択`)
+  }
+
+  async function mergeSelectedM4aFiles() {
+    if (mergeFiles.length < 2) {
+      setMergeStatus('2件以上の m4a を選択してください')
+      return
+    }
+
+    setBusy(true)
+    setProgress(null)
+
+    if (mergeResult) {
+      URL.revokeObjectURL(mergeResult.url)
+      setMergeResult(null)
+    }
+
+    const startedAt = performance.now()
+    const ffmpeg = ffmpegRef.current
+    const inputNames: string[] = []
+    const listName = 'concat_list.txt'
+    const outputName = makeTimestampFileName('merged')
+
+    try {
+      await loadFFmpeg()
+      setMergeStatus('結合準備中')
+      setStatus('m4a 結合準備中')
+
+      for (let i = 0; i < mergeFiles.length; i++) {
+        const file = mergeFiles[i]
+        const inputName = `merge_input_${String(i + 1).padStart(3, '0')}.m4a`
+        inputNames.push(inputName)
+
+        setMergeStatus(`${i + 1}/${mergeFiles.length} 入力中: ${file.name}`)
+        setStatus(`${i + 1}/${mergeFiles.length} 入力中: ${file.name}`)
+        await ffmpeg.writeFile(inputName, await fetchFile(file))
+      }
+
+      const listText = inputNames.map((name) => `file '${name}'`).join('\n')
+      await ffmpeg.writeFile(listName, new TextEncoder().encode(listText))
+
+      setMergeStatus('結合中')
+      setStatus('m4a 結合中')
+
+      await ffmpeg.exec([
+        '-y',
+        '-f',
+        'concat',
+        '-safe',
+        '0',
+        '-i',
+        listName,
+        '-c',
+        'copy',
+        outputName,
+      ])
+
+      const data = await ffmpeg.readFile(outputName)
+      const arrayBuffer = fileDataToArrayBuffer(data)
+      const blob = new Blob([arrayBuffer], { type: 'audio/mp4' })
+      const url = URL.createObjectURL(blob)
+      const totalInputSize = mergeFiles.reduce((sum, file) => sum + file.size, 0)
+
+      setMergeResult({
+        name: outputName,
+        url,
+        inputCount: mergeFiles.length,
+        totalInputSize,
+        outputSize: blob.size,
+        elapsedMs: performance.now() - startedAt,
+      })
+
+      setMergeStatus('結合完了')
+      setStatus('m4a 結合完了')
+    } catch (err) {
+      console.error(err)
+      setMergeStatus(`結合エラー: ${err instanceof Error ? err.message : String(err)}`)
+      setStatus(`結合エラー: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      for (const inputName of inputNames) {
+        try {
+          await ffmpeg.deleteFile(inputName)
+        } catch {
+          // 削除失敗は無視
+        }
+      }
+
+      try {
+        await ffmpeg.deleteFile(listName)
+      } catch {
+        // 削除失敗は無視
+      }
+
+      try {
+        await ffmpeg.deleteFile(outputName)
+      } catch {
+        // 削除失敗は無視
+      }
+
+      setBusy(false)
+    }
+  }
+
   return (
     <main>
       <h1>AAC-LC 128k Peak Safe Converter</h1>
@@ -416,6 +557,49 @@ export function App() {
           disabled={busy}
           onChange={(e) => handleFiles((e.currentTarget as HTMLInputElement).files)}
         />
+      </section>
+
+      <section class="box">
+        <h2>m4a結合</h2>
+        <p>変換済み m4a を複数選択すると、ファイル名順で1本に結合します。</p>
+        <input
+          type="file"
+          accept=".m4a,.M4A,audio/mp4"
+          multiple
+          disabled={busy}
+          onChange={(e) => handleMergeFiles((e.currentTarget as HTMLInputElement).files)}
+        />
+
+        <div class="buttonRow">
+          <button type="button" onClick={mergeSelectedM4aFiles} disabled={busy || mergeFiles.length < 2}>
+            結合する
+          </button>
+        </div>
+
+        <p class="cacheStatus">{mergeStatus}</p>
+
+        {mergeFiles.length > 0 && (
+          <ol>
+            {mergeFiles.map((file, index) => (
+              <li key={`${file.name}-${file.size}-${index}`}>
+                {file.name} ({formatBytes(file.size)})
+              </li>
+            ))}
+          </ol>
+        )}
+
+        {mergeResult && (
+          <div class="result">
+            <a href={mergeResult.url} download={mergeResult.name}>
+              {mergeResult.name}
+            </a>
+            <div>入力: {mergeResult.inputCount} 件</div>
+            <div>
+              {formatBytes(mergeResult.totalInputSize)} → {formatBytes(mergeResult.outputSize)}
+            </div>
+            <div>処理時間: {formatSeconds(mergeResult.elapsedMs)}</div>
+          </div>
+        )}
       </section>
 
       <p class="status">{status}</p>
